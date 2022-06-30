@@ -1,0 +1,646 @@
+import psycopg2 as ps2
+import boto3
+from boto3.s3.transfer import S3Transfer
+import pandas as pd
+import os
+import pickle
+import json
+from io import BytesIO
+from io import StringIO
+from sqlalchemy import create_engine
+from airflow.hooks.postgres_hook import PostgresHook
+from airflow.models import Variable
+import prestodb
+import requests
+import sys
+import base64
+import subprocess
+
+
+DATABASE = os.environ.get("SKULL_DBNAME")
+HOST = os.environ.get("SKULL_HOST")
+PORT = os.environ.get("SKULL_PORT")
+USER = os.environ.get("SKULL_USER")
+PASSWORD = os.environ.get("SKULL_PASSWORD")
+pe_email_password = os.environ.get("REPORT_EMAIL_PASSWORD")
+
+peProdRedshiftAccessKey = os.environ.get("AWS_ACCESS_KEY_ID")
+peProdRedshiftSecretAccessKey = os.environ.get("AWS_SECRET_ACCESS_KEY")
+
+def db_connection_sqlalchemy(**args):
+    conn = create_engine('postgresql://'+ USER +':'+ PASSWORD+'@'+HOST+':'+PORT+'/' +DATABASE)
+    return conn
+
+def pe_emr_presto_connection(presto_connection_json='EMR_PRESTO_CONNECTION_PASSWORD',**kwargs):
+    """
+    Returns a Presto Conenction object for AWS EMR Hive
+    """
+
+    presto_connection_json = Variable.get(presto_connection_json)
+
+    try:
+        presto_connection_json = json.loads(presto_connection_json)
+        presto_connection_dict = dict(presto_connection_json)
+
+        conn=prestodb.dbapi.connect(
+                          host=presto_connection_dict['host'],
+                          port=presto_connection_dict['port'],
+                          user=presto_connection_dict['user'],
+                          catalog=presto_connection_dict['catalog'],
+                          schema=presto_connection_dict['schema'])
+        return conn
+
+    except Exception as error:
+        print("Error - {}".format(error))
+
+def df_from_emr_presto(hql,presto_connection_json='EMR_PRESTO_CONNECTION_PASSWORD',**kwargs):
+    """
+    Returns a Pandas DataFrame from Presto
+    """
+
+    presto_connection_json = Variable.get(presto_connection_json)
+
+    try:
+        presto_connection_json = json.loads(presto_connection_json)
+        presto_connection_dict = dict(presto_connection_json)
+
+        conn=prestodb.dbapi.connect(
+                          host=presto_connection_dict['host'],
+                          port=presto_connection_dict['port'],
+                          user=presto_connection_dict['user'],
+                          catalog=presto_connection_dict['catalog'],
+                          schema=presto_connection_dict['schema'])
+
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(hql.strip().rstrip(';'))
+            data = cursor.fetchall()
+            column_descriptions = cursor.description
+            if data:
+                df = pd.DataFrame(data, **kwargs)
+                df.columns = [c[0] for c in column_descriptions]
+                print("Retrieved the data from Presto")
+            else:
+                df = pd.DataFrame(**kwargs)
+            conn.close()
+            return df
+
+        except Exception as e:
+            conn.close()
+            print(str(e))
+
+    except Exception as error:
+        print("Error - {}".format(error))
+
+
+def db_connection(airflow_conn_id='pe_analytics_dp_redshift',**args):
+    """
+    Returns a Redshift/Postgres Connection object
+    """
+    try:
+        connection = PostgresHook(postgres_conn_id=airflow_conn_id)
+        #Get the connection from Postgres or Redshift
+        conn = connection.get_conn()
+        print("Redshift Connected")
+        return conn
+    except Exception as error:
+        raise Exception("Error connecting to Redshift - {}".format(error))
+
+
+def dataframe_to_csv_on_s3(df,my_bucket,path,filename,iamrole='',delimiter=',',is_header=True,mergedfiletype="csv",null_as='',**kwargs):
+    """
+    Converts a Dataframe to CSV (without creating a local file) and uploads it to S3
+    df - Dataframe to be uploaded
+    my_bucket - S3 Bucket where the file needs to be uploaded. ex - "pe-analytics-mstr"
+    path - folder path leading to where the file needs to be updated ex - "scm_ops/dc_audit/"
+    iamrole -
+    filename - ex "test.csv"
+    null_as - save null values in dataframe as. ex - 'null'. Default value - ''
+    """
+
+
+    if iamrole != '':
+        sts_client = boto3.client('sts')
+        assumed_role_object=sts_client.assume_role(RoleArn=iamrole,RoleSessionName="AssumeRoleSession1")
+        credentials=assumed_role_object['Credentials']
+
+        s3_resource = boto3.resource('s3',aws_access_key_id=credentials['AccessKeyId'],
+                          aws_secret_access_key=credentials['SecretAccessKey'],
+                          aws_session_token = credentials['SessionToken'])
+    else:
+        s3_resource = boto3.resource('s3',aws_access_key_id=peProdRedshiftAccessKey,
+                  aws_secret_access_key=peProdRedshiftSecretAccessKey)
+
+    if mergedfiletype == "parquet":
+        df.columns = df.iloc[0]
+        df.drop(0)
+        print("Checking column names")
+        print(df.columns)
+        print(df.iloc[0])
+        out_buffer = BytesIO()
+        df.to_parquet(out_buffer, index = False, compression = None)
+        s3_resource.Object(my_bucket,path+filename).put(Body=out_buffer.getvalue())
+    else:
+        df.columns = df.columns.astype(str)
+        csv_buffer = StringIO()
+        print(df.columns)
+        print(is_header)
+        df.to_csv(csv_buffer, sep=delimiter, index=False, header=is_header, na_rep=null_as)
+        s3_resource.Object(my_bucket,path+filename).put(Body=csv_buffer.getvalue())
+
+
+def delete_old_file_and_rename_s3_file(oldfilename,newfilename,my_bucket,path,**kwargs):
+    s3= boto3.resource('s3',aws_access_key_id=peProdRedshiftAccessKey,
+                      aws_secret_access_key=peProdRedshiftSecretAccessKey)
+    s3.Object(my_bucket,path+newfilename).delete()
+    print("Old File Deleted")
+    s3.Object(my_bucket,path+newfilename).copy_from(CopySource=my_bucket+"/"+path+oldfilename)
+    s3.Object(my_bucket,path+oldfilename).delete()
+    print("File Renamed")
+
+
+def rename_s3_file(oldfilename,newfilename,my_bucket,path,**kwargs):
+    s3= boto3.resource('s3',aws_access_key_id=peProdRedshiftAccessKey,
+                      aws_secret_access_key=peProdRedshiftSecretAccessKey)
+    s3.Object(my_bucket,path+newfilename).copy_from(CopySource=my_bucket+"/"+path+oldfilename)
+    s3.Object(my_bucket,path+oldfilename).delete()
+    print("File Renamed")
+
+
+def upload_file_to_s3(filename,my_bucket,path,ts=None,convert_to_csv=False,**kwargs):
+
+    """
+    uploads a file from local system to a S3 location
+    my_bucket - S3 Bucket where the file needs to be uploaded. ex - "pe-analytics-mstr"
+    path - folder path leading to where the file needs to be updated ex - "scm_ops/dc_audit/"
+    filename - ex "test.csv"
+    ts - if you need to add the ingestion timestamp to a csv or excel file
+    convert_to_csv - Pass True or False if you want to convert input file to csv
+    """
+
+    s3 = boto3.client(service_name = 's3',aws_access_key_id=peProdRedshiftAccessKey,
+                      aws_secret_access_key=peProdRedshiftSecretAccessKey)
+
+    if convert_to_csv:
+        try:
+            if filename.split('.')[1] != 'csv':
+                df = pd.read_excel(filename)
+            else:
+                df = pd.read_csv(filename)
+            if ts is not None:
+                df['ingested_at'] = ts
+        except:
+            print("File not an excel or csv")
+
+        df.to_csv(filename.split(".")[0] + ".csv",index=False)
+        filename = filename.split(".")[0] + ".csv"
+
+    transfer = S3Transfer(s3)
+    try:
+        transfer.upload_file(filename,my_bucket,path+filename)
+        print("Upload Successful")
+        if convert_to_csv:
+            os.remove(filename)
+    except:
+        print("Upload Failed")
+
+
+def get_df_from_csv_on_s3(filename,my_bucket,path,iamrole="",datatype=str,delimiter=',',head_row=0,**kwargs):
+
+    """
+    my_bucket - S3 Bucket where the file needs to be uploaded. ex - "pe-analytics-mstr"
+    path - folder path leading to where the file needs to be updated ex - "scm_ops/dc_audit/"
+    filename - ex "test.csv"
+    iamrole = The Iam role which is required to access the S3 folder
+    datatype - dictionary which defines column data types. Defaulted to str which will read the csv file as text
+    head_row - The row index which contains the header. Use None if header is not available
+    """
+    if iamrole == "":
+        s3 = boto3.client(service_name = 's3',aws_access_key_id=peProdRedshiftAccessKey,
+                          aws_secret_access_key=peProdRedshiftSecretAccessKey)
+    else:
+        sts_client = boto3.client('sts')
+        assumed_role_object=sts_client.assume_role(RoleArn=iamrole,RoleSessionName="AssumeRoleSession1")
+        credentials=assumed_role_object['Credentials']
+        s3 = boto3.client(service_name = 's3',aws_access_key_id=credentials['AccessKeyId'],
+                          aws_secret_access_key=credentials['SecretAccessKey'],
+                          aws_session_token = credentials['SessionToken'])
+
+
+
+    obj = s3.get_object(Bucket=my_bucket, Key=path+filename)
+    df = pd.read_csv(BytesIO(obj['Body'].read()),sep=delimiter,dtype=datatype,header=head_row)
+    print(type(df))
+    print(df.columns)
+
+    return df
+
+
+def move_s3csv_to_table(filename,my_bucket,path,tablename,schemaname,delimiter=',',**kwargs):
+
+    """
+    my_bucket - S3 Bucket where the file needs to be uploaded. ex - "pe-analytics-mstr"
+    path - folder path leading to where the file needs to be updated ex - "scm_ops/dc_audit/"
+    filename - ex "test.csv"
+    tablename - Redshift table name where the data needs to be inserted ex - "test_table"
+    schemaname - Redshift Schema Name ex - "pre_analytics"
+    """
+
+    # 1.1 Connecting to the Database
+    lakeConnection = db_connection()
+    lakeCursor = lakeConnection.cursor()
+
+    # 1.2 Preparing the insert query
+    lakeInsertQuery = (""" COPY """ + schemaname + """.""" + tablename +
+        """ FROM """ + "'s3://"+ my_bucket + "/" + path + filename + """'""" +
+        """ credentials 'aws_access_key_id="""+peProdRedshiftAccessKey+
+        """;aws_secret_access_key="""+peProdRedshiftSecretAccessKey+
+        """' NULL AS 'NULL' REGION 'ap-south-1' IGNOREBLANKLINES BLANKSASNULL
+        REMOVEQUOTES ACCEPTINVCHARS IGNOREHEADER 1 EMPTYASNULL maxerror 0 delimiter '"""+str(delimiter)+"""'
+        timeformat 'YYYY-MM-DD  HH24:MI:SS';
+        """)
+    # 1.3 Executing the Queries
+    lakeCursor.execute("BEGIN;")
+    lakeCursor.execute(lakeInsertQuery)
+    lakeCursor.execute("COMMIT;")
+    print("Data copied.")
+
+    # 1.4 Closing the Connection and Removing the File | Himanshu Punjabi
+    lakeCursor.close()
+    lakeConnection.close()
+
+def redshift_log_data(writequeryfilepath,**kwargs):
+
+    """
+    writequeryfile - a file which can be read in Python with the query which needs to be fired on Redshift
+    conn - Redshift connection which can be generated using the function db_connection
+    """
+
+    queryfile = open(writequeryfilepath,'r')
+    conn = db_connection()
+    cur = conn.cursor()
+    cur.execute(queryfile.read())
+    conn.commit()
+    cur.close()
+
+
+def merge_s3_csv_partfiles(partfilesbucket,partfilespath,mergedfilename,mergefilebucket,mergefilepath,
+                           partfileheader=0,partfiledelimiter=',',partfileiamrole='',partfiledatatype=str,
+                           mergefileheader=True,mergefiledelimiter=',',mergefileiamrole='',mergedfiletype="csv",**kwargs):
+
+    """
+    A function which will merge partfiles readable by pandas function read_csv and merged back into a file which
+    accepts pandas' to_csv output file format. Please specify the S3 bucket and folder path for input files and
+    the S3 bucket, folder and filename for output file.
+    Use required delimiters for input/output (default: comma) and input the required iamrole which the host machine needs to assume.
+    Different iamrole maybe used for input and output depending on permissions for the user on input and output buckets.
+    Example parameters -
+    partfilesbucket = 'pe-skull-external-data'
+    partfilespath = 'analytics/pe/mstr-tables/scm_ops/logistics/dc_audit_module/dc_audit_final/'
+    partfiledelimiter = "|"
+    partfileiamrole = iamrole which you need to use
+    partfiledatatype = str
+    mergedfilename = "merged_dc_audit.csv"
+    mergefilebucket = 'pe-analytics-mstr'
+    mergefilepath = 'scm_ops/logistics/dc_audit_module/'
+    mergefiledelimiter = "|"
+    mergefileiamrole = ""
+    """
+    if partfileiamrole != '':
+        sts_client = boto3.client('sts')
+        assumed_role_object=sts_client.assume_role(RoleArn=partfileiamrole,RoleSessionName="AssumeRoleSession1")
+        credentials=assumed_role_object['Credentials']
+
+        s3_resource = boto3.resource('s3',aws_access_key_id=credentials['AccessKeyId'],
+                          aws_secret_access_key=credentials['SecretAccessKey'],
+                          aws_session_token = credentials['SessionToken'])
+    else:
+        s3_resource = boto3.resource('s3',aws_access_key_id=peProdRedshiftAccessKey,
+                  aws_secret_access_key=peProdRedshiftSecretAccessKey)
+
+    bucket = s3_resource.Bucket(partfilesbucket)
+    merged_df = pd.DataFrame()
+    for obj in bucket.objects.filter(Prefix=partfilespath):
+        print(obj.key)
+        print(obj.key.split('/')[-1])
+        df = get_df_from_csv_on_s3(obj.key.split('/')[-1],partfilesbucket,partfilespath,partfileiamrole,partfiledatatype,partfiledelimiter,partfileheader)
+        merged_df = merged_df.append(df,ignore_index=True)
+
+    print(merged_df.iloc[0])
+    print(merged_df.columns)
+    print("calling dataframe_to_csv_on_s3")
+    dataframe_to_csv_on_s3(merged_df,mergefilebucket,mergefilepath,mergedfilename,mergefileiamrole,mergefiledelimiter,mergefileheader, mergedfiletype)
+    print("Files Merged into:",mergefilebucket+"/"+mergefilepath+mergedfilename)
+
+
+def update_redshift_table(redshift_table_update_queries,**kwargs):
+    """
+    A function which can be called in Airflow DAGS. Use op_kwargs and pass all the required arguments as stated in the example.
+    This function inserts / upserts data in the Redshift table
+    Parameters
+    ----------
+    "redshift_table_update_queries" : queries which you want to execute on Skull
+    Returns
+    -------
+    None.
+    """
+
+    # Create an object to connect to Skull
+    conn = db_connection()
+    cursor = conn.cursor()
+
+
+
+    # Begin execution of the queries on Redshift
+    cursor.execute("BEGIN;")
+    for query in redshift_table_update_queries:
+
+        cursor.execute(query)
+
+
+    cursor.execute("COMMIT;")
+    cursor.close()
+    conn.close()
+
+def df_from_partfiles(partfilesbucket,partfilespath,partfileheader=0,partfiledelimiter=',',partfileiamrole='',partfiledatatype=str,**kwargs):
+    """
+    A function which can be called in Airflow DAGS. Use op_kwargs and pass all the required arguments as stated in the example.
+    Used to merge partfiles readable by pandas function read_csv and merged dataframe returned to provide a dataframe.
+    Please specify the S3 bucket and folder path for input files and the S3 bucket, folder and filename for output file.
+    Use required delimiters for input/output (default: comma) and input the required iamrole which the host machine needs to assume.
+    Different iamrole maybe used for input and output depending on permissions for the user on input and output buckets.
+    Example parameters -
+    partfilesbucket = 'pe-skull-external-data'
+    partfilespath = 'analytics/pe/mstr-tables/scm_ops/logistics/dc_audit_module/dc_audit_final/'
+    partfiledelimiter = "|"
+    partfileiamrole = iamrole
+    partfiledatatype = str
+    partfileheader = 0 ### Use None if file does not contain any headers ####
+    """
+
+    if partfileiamrole != '':
+        sts_client = boto3.client('sts')
+        assumed_role_object=sts_client.assume_role(RoleArn=partfileiamrole,RoleSessionName="AssumeRoleSession1")
+        credentials=assumed_role_object['Credentials']
+
+        s3_resource = boto3.resource('s3',aws_access_key_id=credentials['AccessKeyId'],
+                          aws_secret_access_key=credentials['SecretAccessKey'],
+                          aws_session_token = credentials['SessionToken'])
+    else:
+        s3_resource = boto3.resource('s3',aws_access_key_id=peProdRedshiftAccessKey,
+                  aws_secret_access_key=peProdRedshiftSecretAccessKey)
+
+    bucket = s3_resource.Bucket(partfilesbucket)
+    merged_df = pd.DataFrame()
+    for obj in bucket.objects.filter(Prefix=partfilespath):
+        df = get_df_from_csv_on_s3(obj.key.split('/')[-1],partfilesbucket,partfilespath,partfileiamrole,partfiledatatype,partfiledelimiter,partfileheader)
+        merged_df = merged_df.append(df,ignore_index=True)
+
+    return merged_df
+
+def n_sigma_anomaly_detection(time_stamp,metric,time_agg='day_of_week',n=2,**kwargs):
+
+    """
+    This function can be used to detect anomalies in the metrics based on boundary conditions established
+    through mean and standard deviation aggregated at specified level (time series based)
+    'time_stamp' argument will take a timestamp series
+    'metric' argument will take the series of normally distributed attribute over which anomaly is to identified
+    'time_agg' argument will take the aggregator level at which the mean and standard deviation of the metric is
+     to be calculated
+    'time_agg' will take distinct values of 'hour','date','week','day_of_week','month','year'
+    'n' argument will take distinct whole number values as a multiplicative factor of standard deviation which will
+     establish boundary conditions
+    """
+
+    dframe1 = pd.DataFrame()
+    dframe1['time_stamp'] = time_stamp
+    dframe1['time_stamp']= pd.to_datetime(dframe1['time_stamp'])
+
+    if time_agg == 'hour':
+        dframe1['hour'] = dframe1['time_stamp'].dt.hour
+    elif time_agg == 'date':
+        dframe1['date'] = dframe1['time_stamp'].dt.date
+    elif time_agg == 'year':
+        dframe1['year'] = dframe1['time_stamp'].dt.year
+    elif time_agg == 'week':
+        dframe1['week'] = dframe1['time_stamp'].dt.week
+    elif time_agg == 'month':
+        dframe1['month'] = dframe1['time_stamp'].dt.month
+    else:
+        dframe1['day_of_week'] = dframe1['time_stamp'].dt.weekday
+
+    dframe1['metric'] = metric
+    x= dframe1.groupby([time_agg], as_index=False)['metric'].mean()
+    y= dframe1.groupby([time_agg], as_index=False)['metric'].std()
+    x.rename(columns = {'metric':'mean'}, inplace = True)
+    y.rename(columns={'metric':'std'},inplace= True)
+    y['std'].fillna(value=y['std'].mean(), inplace=True)
+    x['n_std'] = (n * y['std'])
+    z= pd.merge(dframe1,x,on=[time_agg])
+
+    z['alert']= z.apply(lambda z: 0 if (z['metric'] > z['mean'] - z['n_std']) else 1,axis=1)
+    z.sort_values(by = 'time_stamp',inplace= True)
+
+    return z
+
+
+def upload_excel_to_s3(filename, my_bucket, path, iamrole="", ts=None):
+
+    """
+    uploads a file from local system to a S3 location
+    my_bucket - S3 Bucket where the file needs to be uploaded. ex - "pe-analytics-mstr"
+    path - folder path leading to where the file needs to be updated ex - "scm_ops/dc_audit/"
+    filename - ex "test.csv"
+    ts - if you need to add the ingestion timestamp to a csv or excel file
+    convert_to_csv - Pass True or False if you want to convert input file to csv
+    """
+
+    if iamrole != '':
+        sts_client = boto3.client('sts')
+        assumed_role_object=sts_client.assume_role(RoleArn=iamrole,RoleSessionName="AssumeRoleSession1")
+        credentials=assumed_role_object['Credentials']
+
+        s3_resource = boto3.resource('s3',aws_access_key_id=credentials['AccessKeyId'],
+                          aws_secret_access_key=credentials['SecretAccessKey'],
+                          aws_session_token = credentials['SessionToken'])
+    else:
+        s3_resource = boto3.resource('s3',aws_access_key_id=peProdRedshiftAccessKey,
+                  aws_secret_access_key=peProdRedshiftSecretAccessKey)
+
+
+#    if convert_to_csv:
+#        try:
+#            if filename.split('.')[1] != 'csv':
+#                df = pd.read_excel(filename)
+#            else:
+#                df = pd.read_csv(filename)
+#            if ts is not None:
+#                df['ingested_at'] = ts
+#        except:
+#            print("File not an excel or csv")
+
+#        df.to_csv(filename.split(".")[0] + ".csv",index=False)
+#        filename = filename.split(".")[0] + ".csv"
+
+ #   transfer = S3Transfer(s3_resource)
+    try:
+        s3_resource.meta.client.upload_file(filename,my_bucket,path+filename)
+        print("Upload Successful")
+#        if convert_to_csv:
+#            os.remove(filename)
+    except:
+        print("Upload Failed")
+
+def download_file_from_s3(my_bucket,s3filename,s3path,localfilename,iamrole='',**kwargs):
+
+    """
+    downloads a file from as S3 location to local system
+    my_bucket - S3 Bucket where the file needs to be uploaded. ex - "pe-analytics-mstr"
+    path - folder path leading to where the file needs to be updated ex - "scm_ops/dc_audit/"
+    filename - ex "test.csv"
+    localfilename - ex "test_local.csv"
+    ts - if you need to add the ingestion timestamp to a csv or excel file
+    convert_to_csv - Pass True or False if you want to convert input file to csv
+    """
+
+    if iamrole != '':
+
+        sts_client = boto3.client('sts')
+        assumed_role_object=sts_client.assume_role(RoleArn=iamrole,RoleSessionName="AssumeRoleSession1")
+        credentials=assumed_role_object['Credentials']
+
+        s3 = boto3.client(service_name = 's3',aws_access_key_id=credentials['AccessKeyId'],
+                          aws_secret_access_key=credentials['SecretAccessKey'],
+                          aws_session_token = credentials['SessionToken'])
+    else:
+
+        s3 = boto3.client(service_name = 's3',aws_access_key_id=peProdRedshiftAccessKey,
+                          aws_secret_access_key=peProdRedshiftSecretAccessKey)
+
+    transfer = S3Transfer(s3)
+    try:
+        print(my_bucket,s3path+s3filename,os.path.join(localfilename))
+        transfer.download_file(my_bucket,s3path+s3filename,os.path.join(localfilename))
+        print("Download Successful")
+    except Exception as e:
+        print("Download Failed:",str(e))
+
+
+def read_pickle_from_s3(filename,my_bucket,path,iamrole="",**kwargs):
+
+    """
+    my_bucket - S3 Bucket where the file needs to be uploaded. ex - "pe-analytics-mstr"
+    path - folder path leading to where the file needs to be updated ex - "scm_ops/dc_audit/"
+    filename - ex "test.csv"
+    iamrole = The Iam role which is required to access the S3 folder
+    """
+    if iamrole == "":
+        s3 = boto3.resource(service_name = 's3',aws_access_key_id=peProdRedshiftAccessKey,
+                          aws_secret_access_key=peProdRedshiftSecretAccessKey)
+    else:
+        sts_client = boto3.client('sts')
+        assumed_role_object=sts_client.assume_role(RoleArn=iamrole,RoleSessionName="AssumeRoleSession1")
+        credentials=assumed_role_object['Credentials']
+        s3 = boto3.resource(service_name = 's3',aws_access_key_id=credentials['AccessKeyId'],
+                          aws_secret_access_key=credentials['SecretAccessKey'],
+                          aws_session_token = credentials['SessionToken'])
+
+    text_content_bytes = s3.Bucket(my_bucket).Object(path+filename).get()['Body'].read()
+    text_content = pickle.loads(text_content_bytes)
+    return text_content
+
+def read_json_from_s3(filename,my_bucket,path,iamrole="",**kwargs):
+
+    """
+    my_bucket - S3 Bucket where the file needs to be uploaded. ex - "pe-analytics-mstr"
+    path - folder path leading to where the file needs to be updated ex - "scm_ops/dc_audit/"
+    filename - ex "test.csv"
+    iamrole = The Iam role which is required to access the S3 folder
+    """
+    if iamrole == "":
+        s3 = boto3.resource(service_name = 's3',aws_access_key_id=peProdRedshiftAccessKey,
+                          aws_secret_access_key=peProdRedshiftSecretAccessKey)
+    else:
+        sts_client = boto3.client('sts')
+        assumed_role_object=sts_client.assume_role(RoleArn=iamrole,RoleSessionName="AssumeRoleSession1")
+        credentials=assumed_role_object['Credentials']
+        s3 = boto3.resource(service_name = 's3',aws_access_key_id=credentials['AccessKeyId'],
+                          aws_secret_access_key=credentials['SecretAccessKey'],
+                          aws_session_token = credentials['SessionToken'])
+
+    text_content_bytes = s3.Bucket(my_bucket).Object(path+filename).get()['Body'].read()
+    text_content = json.loads(text_content_bytes)
+    return text_content
+
+
+def slack_notification(url_variable,title,message,color="#9733EE",**kwargs):
+
+    url =  Variable.get(url_variable)
+
+    slack_data = {
+        "attachments": [
+                {
+                    "color": color,
+                    "fields": [
+                        {
+                            "title": title,
+                            "value": message,
+                            "short": "false",
+                        }
+                    ]
+                }
+            ]
+        }
+
+    byte_length = str(sys.getsizeof(slack_data))
+    headers = {'Content-Type': "application/json", 'Content-Length': byte_length}
+    response = requests.post(url, data=json.dumps(slack_data), headers=headers)
+    if response.status_code != 200:
+        print("Error:",response.status_code,response.text)
+    else:
+        print("Slack Notification Sent")
+
+
+def mstr_job_trigger(envVar,mstrBatchJob,**kwargs):
+
+    """
+    This function is build for trigger MSTR Scheduled Jobs from Airflow. Following Paramaters are needed
+    envVar : Environment variable stored in vault which stores the SSH Key in Base64 format which is then stored into a pem file
+    mstrBatchJob : Job created by MSTR Admin which contains the Cube which will be refreshed using the batch file
+    """
+
+    try:
+        ### GENERATE THE PEM FILE ###
+        mstrenvkey = os.environ.get(envVar)
+        pemkey = base64.b64decode(mstrenvkey)
+        pemFileName = str(envVar) + ".pem"
+
+        with open(pemFileName, 'w') as fh_w:
+            fh_w.write(pemkey.decode('UTF-8'))
+
+        os.chmod(pemFileName, 0o400)
+
+        ### SSH TO MSTR MACHINE TO TRIGGER THE EVENT ###
+        try:
+            MSTR_SSH_TRIGGER = Variable.get("MSTR_SSH_TRIGGER")
+            bashCommand = MSTR_SSH_TRIGGER.format(pemFileName,mstrBatchJob)
+            process = subprocess.Popen(bashCommand.split(), stdout=subprocess.PIPE)
+            output, error = process.communicate()
+
+            print("Output:\n",output)
+            print("Error:\n",error)
+
+        except Exception as e:
+            output, error = ("Error",str(e))
+            print("Event Refresh Error:\n",str(e))
+
+        ### REMOVE THE PEM FILE ###
+        os.remove(pemFileName)
+        print("PEM file deleted")
+
+    except Exception as e:
+        print("Error:\n",str(e))
+        output, error = ("Error",str(e))
+
+    return output, error
