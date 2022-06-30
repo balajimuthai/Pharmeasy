@@ -1,0 +1,648 @@
+from airflow import DAG
+from airflow.operators.python_operator import PythonOperator
+from datetime import datetime, date, timedelta
+from sqlalchemy import create_engine
+import json
+import pandas as pd
+import os
+import sys
+import gspread
+import numpy as np
+from oauth2client.service_account import ServiceAccountCredentials
+from gspread_dataframe import set_with_dataframe
+from airflow.contrib.operators.qubole_operator import QuboleOperator
+from airflow.models import Variable
+import boto3
+from boto3.s3.transfer import S3Transfer
+from airflow.operators.bash_operator import BashOperator
+
+import sys
+AIRFLOW_HOME = os.environ.get("AIRFLOW_HOME")
+sys.path.insert(0, AIRFLOW_HOME+"/dags/")
+from skull_mr_operator_analytics import SkullMROperatorAnalytics
+
+dag_owner = "prasad.dalvi@pharmeasy.in"
+start_date = datetime(2021,11,16)
+email_ids = ["prasad.dalvi@pharmeasy.in"]
+dag_name = "ba_gsheet_to_skull_hive_rs"
+schedule_interval = '00 00 * * *' # 
+dags_folder = "Marketing_dashboards/BA_ML_Vertical/"
+python_version = "3.6"
+dag_description = "ba_gsheet_to_skull"
+
+airflow_home = os.environ.get("AIRFLOW_HOME")
+sys.path.insert(0, airflow_home + "/dags/apps/")
+
+pe_dl_dbname = os.environ.get("SKULL_DBNAME")
+pe_dl_host = os.environ.get("SKULL_HOST")
+pe_dl_port = os.environ.get("SKULL_PORT")
+pe_dl_user = os.environ.get("SKULL_USER")
+pe_dl_password = os.environ.get("SKULL_PASSWORD")
+
+connect = 'postgresql://'+ pe_dl_user +':'+ pe_dl_password+'@'+pe_dl_host+':'+'5439'+'/' +pe_dl_dbname
+
+conn = create_engine(connect)
+
+default_args = {
+                "owner" : dag_owner,
+                "depends_on_past" : False,
+                "start_date" : start_date,
+                "email" : email_ids,
+                "email_on_failure" : True,
+                "email_on_retry" : False,
+                 "retries":1,
+                "qubole_connid" : "qubole_default"
+               }
+dag = DAG(
+          dag_name,
+          default_args = default_args,
+          description = dag_description,
+          catchup = False,
+          schedule_interval = schedule_interval
+         )
+
+def func():	 
+
+#   franchise_inventory_stores table update
+    #Get google sheet credentials
+    GDRIVEAUTH = Variable.get("pe-google-drive-password")
+    GDRIVEAUTHDICT = json.loads(GDRIVEAUTH)
+
+    scope = ['https://spreadsheets.google.com/feeds',
+            'https://www.googleapis.com/auth/drive']
+
+    credentials = ServiceAccountCredentials.from_json_keyfile_dict(GDRIVEAUTHDICT,scope)
+
+    client = gspread.authorize(credentials)
+    #Share google sheet with peanalytics-gdrive@glassy-droplet-322416.iam.gserviceaccount.com id.
+    
+    sheet_name = 'BA Vertical Mapping'
+
+    sch,tab = "reporting_batch", "business_alliances_vertical"
+    first_table = sch+"."+tab
+    
+    query = "DELETE FROM " + first_table
+
+    conn.execute(query)
+    
+    sheet=client.open(sheet_name).worksheet(first_table)
+    list_of_hashes = sheet.get_all_records()
+        
+    df=pd.DataFrame(list_of_hashes)
+#     df.dropna(how = 'any', axis = 1, inplace=True)
+    #Fill empty spaces with null
+    df.replace('',np.NaN, inplace=True)
+
+    df.rename(columns = {'coupon_id':'coupon_id',
+	    		        'promotion_name':'promotion_name',
+                         'vertical_name':'vertical_name',
+                         'priority':'priority',
+                         'partner_name':'partner_name'
+                         }, inplace=True)
+    
+    df['updated_at'] = date.today()
+    
+    df.to_sql(tab, schema=sch, if_exists = 'append', con = connect, index=False, method='multi', chunksize= 50000)
+
+    print("Data pushed to", first_table)
+    
+    #Get the iamrole
+    iamrole = Variable.get("pe-role-analytics-password-dp")
+    #Connect to AWS client
+    sts_client = boto3.client('sts')
+    #Use the role and fetch required keys
+    assumed_role_object=sts_client.assume_role(RoleArn=iamrole,RoleSessionName="AssumeRoleSession1")
+    credentials=assumed_role_object['Credentials']
+    #Establish connection to s3 service
+    s3_resource = boto3.resource('s3',aws_access_key_id=credentials['AccessKeyId'],
+                        aws_secret_access_key=credentials['SecretAccessKey'],
+                        aws_session_token = credentials['SessionToken'])
+
+    # transfer = S3Transfer(s3)
+    
+    #Enter required file name
+    filename = "business_alliances_vertical_gsheet"
+    df.to_csv(filename + ".csv",index=False,header = False, sep="^")
+    filename = filename + ".csv"
+    
+     #Enter the bucket name where the data has to be pushed
+    my_bucket = "pe-skull-external-data"
+    
+    #Give the path in the bucket (can be non existent)
+    path = "analytics/pe/business_alliances_vertical_gsheet/"
+    
+#     (File gets pushed to s3) Please check the logs to confirm successful push as error wont be thrown because we're handling the exceptions
+    try:
+        # transfer.upload_file(filename,my_bucket,path+filename)
+        # print("Upload Successful")
+        # os.remove(filename)
+	
+        s3_resource.meta.client.upload_file(filename,my_bucket,path+filename)
+        print("Upload Successful")
+        os.remove(filename)
+
+    except Exception as e:
+        print(e)
+        print("Upload Failed")
+        
+    sch,tab = "reporting_batch", "business_alliances_vertical_media_source"
+    first_table = sch+"."+tab
+
+    query2 = "DELETE FROM " + first_table
+
+    conn.execute(query2)
+
+    sheet=client.open(sheet_name).worksheet(first_table)
+    list_of_hashes = sheet.get_all_records()
+    
+    df=pd.DataFrame(list_of_hashes)
+#     df.dropna(how = 'any', axis = 1, inplace=True)
+    #Fill empty spaces with null
+    df.replace('',np.NaN, inplace=True)
+
+    df.rename(columns = {'media_source':'media_source',
+                         'vertical_name':'vertical_name',
+                         'priority':'priority',
+                         'partner_name':'partner_name'
+                         }, inplace=True)
+    df['updated_at'] = date.today()
+    
+    df.to_sql(tab, schema=sch, if_exists = 'append', con = connect, index=False, method='multi', chunksize= 50000)
+
+    print("Data pushed to", first_table)
+    
+    #Get the iamrole
+    iamrole = Variable.get("pe-role-analytics-password-dp")
+    #Connect to AWS client
+    sts_client = boto3.client('sts')
+    #Use the role and fetch required keys
+    assumed_role_object=sts_client.assume_role(RoleArn=iamrole,RoleSessionName="AssumeRoleSession1")
+    credentials=assumed_role_object['Credentials']
+    #Establish connection to s3 service
+    s3_resource = boto3.resource('s3',aws_access_key_id=credentials['AccessKeyId'],
+                        aws_secret_access_key=credentials['SecretAccessKey'],
+                        aws_session_token = credentials['SessionToken'])
+
+    # transfer = S3Transfer(s3)
+    
+    #Enter required file name
+    filename = "business_alliances_vertical_media_source_gsheet"
+    df.to_csv(filename + ".csv",index=False,header = False, sep="^")
+    filename = filename + ".csv"
+    
+     #Enter the bucket name where the data has to be pushed
+    my_bucket = "pe-skull-external-data"
+    
+    #Give the path in the bucket (can be non existent)
+    path = "analytics/pe/business_alliances_vertical_media_source_gsheet/"
+    
+#     (File gets pushed to s3) Please check the logs to confirm successful push as error wont be thrown because we're handling the exceptions
+    try:
+        # transfer.upload_file(filename,my_bucket,path+filename)
+        # print("Upload Successful")
+        # os.remove(filename)
+
+        s3_resource.meta.client.upload_file(filename,my_bucket,path+filename)
+        print("Upload Successful")
+        os.remove(filename)
+
+    except Exception as e:
+        print(e)
+        print("Upload Failed")
+        
+    sch,tab = "reporting_batch", "ba_loyalty_program"
+    first_table = sch+"."+tab
+
+    query3 = "DELETE FROM " + first_table
+
+    conn.execute(query3)
+
+    sheet=client.open(sheet_name).worksheet(first_table)
+    list_of_hashes = sheet.get_all_records()
+    
+    df=pd.DataFrame(list_of_hashes)
+#     df.dropna(how = 'any', axis = 1, inplace=True)
+    #Fill empty spaces with null
+    df.replace('',np.NaN, inplace=True)
+
+    df.rename(columns = {'partner_name':'partner_name',
+	    		        'program_id':'program_id',
+                         'vertical_name':'vertical_name'
+                         }, inplace=True)
+    #df['updated_at'] = date.today()
+    
+    df.to_sql(tab, schema=sch, if_exists = 'append', con = connect, index=False, method='multi', chunksize= 50000)
+
+    print("Data pushed to", first_table);
+    
+    #Get the iamrole
+    iamrole = Variable.get("pe-role-analytics-password-dp")
+    #Connect to AWS client
+    sts_client = boto3.client('sts')
+    #Use the role and fetch required keys
+    assumed_role_object=sts_client.assume_role(RoleArn=iamrole,RoleSessionName="AssumeRoleSession1")
+    credentials=assumed_role_object['Credentials']
+    #Establish connection to s3 service
+    s3_resource = boto3.resource('s3',aws_access_key_id=credentials['AccessKeyId'],
+                        aws_secret_access_key=credentials['SecretAccessKey'],
+                        aws_session_token = credentials['SessionToken'])
+
+    # transfer = S3Transfer(s3)
+    
+    #Enter required file name
+    filename = "ba_loyalty_program_gsheet"
+    df.to_csv(filename + ".csv",index=False,header = False, sep="^")
+    filename = filename + ".csv"
+    
+     #Enter the bucket name where the data has to be pushed
+    my_bucket = "pe-skull-external-data"
+    
+    #Give the path in the bucket (can be non existent)
+    path = "analytics/pe/ba_loyalty_program_gsheet/"
+    
+#     (File gets pushed to s3) Please check the logs to confirm successful push as error wont be thrown because we're handling the exceptions
+    try:
+        # transfer.upload_file(filename,my_bucket,path+filename)
+        # print("Upload Successful")
+        # os.remove(filename)
+
+        s3_resource.meta.client.upload_file(filename,my_bucket,path+filename)
+        print("Upload Successful")
+        os.remove(filename)
+
+    except Exception as e:
+        print(e)
+        print("Upload Failed")
+
+    sch,tab = "reporting_batch", "affiliates_media_source"
+    first_table = sch+"."+tab
+
+    query4 = "DELETE FROM " + first_table
+
+    conn.execute(query4)
+
+    sheet=client.open(sheet_name).worksheet(first_table)
+    list_of_hashes = sheet.get_all_records()
+    
+    df=pd.DataFrame(list_of_hashes)
+    #Fill empty spaces with null
+    df.replace('',np.NaN, inplace=True)
+
+    df['updated_at'] = date.today()
+    
+    df.to_sql(tab, schema=sch, if_exists = 'append', con = connect, index=False, method='multi', chunksize= 50000)
+
+    print("Data pushed to", first_table)
+    
+    #Get the iamrole
+    iamrole = Variable.get("pe-role-analytics-password-dp")
+    #Connect to AWS client
+    sts_client = boto3.client('sts')
+    #Use the role and fetch required keys
+    assumed_role_object=sts_client.assume_role(RoleArn=iamrole,RoleSessionName="AssumeRoleSession1")
+    credentials=assumed_role_object['Credentials']
+    #Establish connection to s3 service
+    s3_resource = boto3.resource('s3',aws_access_key_id=credentials['AccessKeyId'],
+                        aws_secret_access_key=credentials['SecretAccessKey'],
+                        aws_session_token = credentials['SessionToken'])
+
+    # transfer = S3Transfer(s3)
+    
+    #Enter required file name
+    filename = "affiliates_media_source"
+    df.to_csv(filename + ".csv",index=False,header = False, sep="^")
+    filename = filename + ".csv"
+    
+     #Enter the bucket name where the data has to be pushed
+    my_bucket = "pe-skull-external-data"
+    
+    #Give the path in the bucket (can be non existent)
+    path = "analytics/pe/affiliates_media_source/"
+    
+#     (File gets pushed to s3) Please check the logs to confirm successful push as error wont be thrown because we're handling the exceptions
+    try:
+        # transfer.upload_file(filename,my_bucket,path+filename)
+        # print("Upload Successful")
+        # os.remove(filename)
+
+        s3_resource.meta.client.upload_file(filename,my_bucket,path+filename)
+        print("Upload Successful")
+        os.remove(filename)
+
+    except Exception as e:
+        print(e)
+        print("Upload Failed")
+	
+    sch,tab = "reporting_batch", "campaign_benchmark"
+    first_table = sch+"."+tab
+
+    query5 = "DELETE FROM " + first_table
+
+    conn.execute(query5)
+
+    sheet=client.open(sheet_name).worksheet(first_table)
+    list_of_hashes = sheet.get_all_records()
+    
+    df=pd.DataFrame(list_of_hashes)
+#     df.dropna(how = 'any', axis = 1, inplace=True)
+    #Fill empty spaces with null
+    df.replace('',np.NaN, inplace=True)
+
+    
+    df.to_sql(tab, schema=sch, if_exists = 'append', con = connect, index=False, method='multi', chunksize= 50000)
+
+    print("Data pushed to", first_table);
+    
+    #Get the iamrole
+    iamrole = Variable.get("pe-role-analytics-password-dp")
+    #Connect to AWS client
+    sts_client = boto3.client('sts')
+    #Use the role and fetch required keys
+    assumed_role_object=sts_client.assume_role(RoleArn=iamrole,RoleSessionName="AssumeRoleSession1")
+    credentials=assumed_role_object['Credentials']
+    #Establish connection to s3 service
+    s3_resource = boto3.resource('s3',aws_access_key_id=credentials['AccessKeyId'],
+                        aws_secret_access_key=credentials['SecretAccessKey'],
+                        aws_session_token = credentials['SessionToken'])
+
+    # transfer = S3Transfer(s3)
+    
+    #Enter required file name
+    filename = "campaign_benchmark"
+    df.to_csv(filename + ".csv",index=False,header = False, sep="^")
+    filename = filename + ".csv"
+    
+     #Enter the bucket name where the data has to be pushed
+    my_bucket = "pe-skull-external-data"
+    
+    #Give the path in the bucket (can be non existent)
+    path = "analytics/pe/campaign_benchmark/"
+	
+	
+	#     (File gets pushed to s3) Please check the logs to confirm successful push as error wont be thrown because we're handling the exceptions
+    try:
+        # transfer.upload_file(filename,my_bucket,path+filename)
+        # print("Upload Successful")
+        # os.remove(filename)
+
+        s3_resource.meta.client.upload_file(filename,my_bucket,path+filename)
+        print("Upload Successful")
+        os.remove(filename)
+
+    except Exception as e:
+        print(e)
+        print("Upload Failed")
+   
+    sch,tab = "reporting_batch", "ba_registration_media_source"
+    first_table = sch+"."+tab
+
+    query5 = "DELETE FROM " + first_table
+
+    conn.execute(query5)
+
+    sheet=client.open(sheet_name).worksheet(first_table)
+    list_of_hashes = sheet.get_all_records()
+    
+    df=pd.DataFrame(list_of_hashes)
+#     df.dropna(how = 'any', axis = 1, inplace=True)
+    #Fill empty spaces with null
+    df.replace('',np.NaN, inplace=True)
+
+    
+    df.to_sql(tab, schema=sch, if_exists = 'append', con = connect, index=False, method='multi', chunksize= 50000)
+
+    print("Data pushed to", first_table);
+    
+    #Get the iamrole
+    iamrole = Variable.get("pe-role-analytics-password-dp")
+    #Connect to AWS client
+    sts_client = boto3.client('sts')
+    #Use the role and fetch required keys
+    assumed_role_object=sts_client.assume_role(RoleArn=iamrole,RoleSessionName="AssumeRoleSession1")
+    credentials=assumed_role_object['Credentials']
+    #Establish connection to s3 service
+    s3_resource = boto3.resource('s3',aws_access_key_id=credentials['AccessKeyId'],
+                        aws_secret_access_key=credentials['SecretAccessKey'],
+                        aws_session_token = credentials['SessionToken'])
+
+    # transfer = S3Transfer(s3)
+    
+    #Enter required file name
+    filename = "registration_media_source"
+    df.to_csv(filename + ".csv",index=False,header = False, sep="^")
+    filename = filename + ".csv"
+    
+     #Enter the bucket name where the data has to be pushed
+    my_bucket = "pe-skull-external-data"
+    
+    #Give the path in the bucket (can be non existent)
+    path = "analytics/pe/registration_media_source/"
+	
+	
+	#     (File gets pushed to s3) Please check the logs to confirm successful push as error wont be thrown because we're handling the exceptions
+    try:
+        # transfer.upload_file(filename,my_bucket,path+filename)
+        # print("Upload Successful")
+        # os.remove(filename)
+
+        s3_resource.meta.client.upload_file(filename,my_bucket,path+filename)
+        print("Upload Successful")
+        os.remove(filename)
+
+    except Exception as e:
+        print(e)
+        print("Upload Failed")
+    
+query_a = """
+DROP TABLE IF EXISTS reporting_batch.business_alliances_vertical;
+CREATE EXTERNAL TABLE IF NOT EXISTS reporting_batch.business_alliances_vertical
+(
+	coupon_id integer
+	,promotion_name STRING
+	,vertical_name STRING
+	,priority STRING
+  ,partner_name STRING
+  , updated_at DATE
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '^'
+STORED AS TEXTFILE LOCATION
+'s3://pe-skull-external-data/analytics/pe/business_alliances_vertical_gsheet/';
+"""	
+print("Data pushed to table.")
+
+query_b = """
+DROP TABLE IF EXISTS reporting_batch.business_alliances_vertical_media_source;
+CREATE EXTERNAL TABLE IF NOT EXISTS reporting_batch.business_alliances_vertical_media_source
+(
+	 media_source STRING
+	,vertical_name STRING
+  ,priority string
+  ,partner_name string
+	,updated_at DATE
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '^'
+STORED AS TEXTFILE LOCATION
+'s3://pe-skull-external-data/analytics/pe/business_alliances_vertical_media_source_gsheet/';
+"""
+
+query_c = """
+DROP TABLE IF EXISTS reporting_batch.ba_loyalty_program;
+CREATE EXTERNAL TABLE IF NOT EXISTS reporting_batch.ba_loyalty_program
+(
+	partner_name STRING
+	,program_id integer
+	,vertical_name STRING
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '^'
+STORED AS TEXTFILE LOCATION
+'s3://pe-skull-external-data/analytics/pe/ba_loyalty_program_gsheet/';
+"""
+
+query_d = """
+DROP TABLE IF EXISTS reporting_batch.affiliates_media_source;
+CREATE EXTERNAL TABLE IF NOT EXISTS reporting_batch.affiliates_media_source
+(
+	media_source STRING
+	,affilates STRING
+	,updated_at date
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '^'
+STORED AS TEXTFILE LOCATION
+'s3://pe-skull-external-data/analytics/pe/affiliates_media_source/';
+"""
+
+query_e = """
+DROP TABLE IF EXISTS reporting_batch.campaign_benchmark;
+CREATE EXTERNAL TABLE IF NOT EXISTS reporting_batch.campaign_benchmark
+(
+	campaign_grouping STRING
+	,metrics integer
+	,value STRING
+	,updated_at date
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '^'
+STORED AS TEXTFILE LOCATION
+'s3://pe-skull-external-data/analytics/pe/campaign_benchmark/';
+"""
+
+query_f = """
+DROP TABLE IF EXISTS reporting_batch.ba_registration_media_source;
+CREATE EXTERNAL TABLE IF NOT EXISTS reporting_batch.ba_registration_media_source
+(
+	registration_media_source STRING
+	,registration_source_attribution string
+	,vertical  STRING
+	,Partner STRING
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '^'
+STORED AS TEXTFILE LOCATION
+'s3://pe-skull-external-data/analytics/pe/registration_media_source/';
+"""
+
+data_push = PythonOperator(
+                    task_id = "data_push",
+                    python_callable = func,
+                    op_kwargs={},
+                    dag = dag
+                   )
+
+s3_query_folder = dag_name
+# query_location_on_github= AIRFLOW_HOME + "/" + "dags/Consumer/queries/"
+query_file_name_a = "business_alliances_vertical"
+query_file_name_b = "business_alliances_vertical_media_source"
+query_file_name_c = "ba_loyalty_program"
+query_file_name_d = "affiliates_media_source"
+query_file_name_e = "campaign_benchmark"
+query_file_name_f = "registration_media_source"
+
+table_creation_a = SkullMROperatorAnalytics(
+task_id = query_file_name_a,
+cluster_name = Variable.get("DP_EMR_HIVE_CLUSTER"),
+name = query_file_name_a,
+arguments = query_a,
+query_location = "analytics/pe/emr_queries/" + s3_query_folder + '/',
+filename = None,
+query_airflow_location = None,
+s3_bucket = "pe-skull-external-data",
+dag = dag
+)
+
+table_creation_b = SkullMROperatorAnalytics(
+task_id = query_file_name_b,
+cluster_name = Variable.get("DP_EMR_HIVE_CLUSTER"),
+name = query_file_name_b,
+arguments = query_b,
+query_location = "analytics/pe/emr_queries/" + s3_query_folder + '/',
+filename = None,
+query_airflow_location = None,
+s3_bucket = "pe-skull-external-data",
+dag = dag
+)
+
+table_creation_c = SkullMROperatorAnalytics(
+task_id = query_file_name_c,
+cluster_name = Variable.get("DP_EMR_HIVE_CLUSTER"),
+name = query_file_name_c,
+arguments = query_c,
+query_location = "analytics/pe/emr_queries/" + s3_query_folder + '/',
+filename = None,
+query_airflow_location = None,
+s3_bucket = "pe-skull-external-data",
+dag = dag
+)
+
+table_creation_d = SkullMROperatorAnalytics(
+task_id = query_file_name_d,
+cluster_name = Variable.get("DP_EMR_HIVE_CLUSTER"),
+name = query_file_name_d,
+arguments = query_d,
+query_location = "analytics/pe/emr_queries/" + s3_query_folder + '/',
+filename = None,
+query_airflow_location = None,
+s3_bucket = "pe-skull-external-data",
+dag = dag
+)
+
+table_creation_e = SkullMROperatorAnalytics(
+task_id = query_file_name_e,
+cluster_name = Variable.get("DP_EMR_HIVE_CLUSTER"),
+name = query_file_name_e,
+arguments = query_e,
+query_location = "analytics/pe/emr_queries/" + s3_query_folder + '/',
+filename = None,
+query_airflow_location = None,
+s3_bucket = "pe-skull-external-data",
+dag = dag
+)
+
+table_creation_f = SkullMROperatorAnalytics(
+task_id = query_file_name_f,
+cluster_name = Variable.get("DP_EMR_HIVE_CLUSTER"),
+name = query_file_name_f,
+arguments = query_f,
+query_location = "analytics/pe/emr_queries/" + s3_query_folder + '/',
+filename = None,
+query_airflow_location = None,
+s3_bucket = "pe-skull-external-data",
+dag = dag
+)
+
+
+
+data_push >> table_creation_a
+
+data_push >> table_creation_b
+
+data_push >> table_creation_c
+
+data_push >> table_creation_d
+
+data_push >> table_creation_e
+
+data_push >> table_creation_f
+
+
+print("DAG End")
+
+    
+conn.dispose()    
