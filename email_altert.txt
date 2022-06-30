@@ -1,0 +1,313 @@
+import pandas as pd
+from sqlalchemy import create_engine
+import numpy as np
+from airflow import DAG
+from airflow.operators.python_operator import PythonOperator
+from datetime import datetime, date, timedelta
+import pandas as pd
+import psycopg2
+import os
+import email
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+import smtplib as smt
+import sys
+from airflow.utils.helpers import cross_downstream
+from airflow.operators.sensors import ExternalTaskSensor
+from airflow.models import Variable
+from pe_analytics_module import df_from_partfiles,get_df_from_csv_on_s3
+
+dag_owner = "balaji.m@pharmeasy.in"
+start_date = datetime(2021,12,27)
+email_ids = ["balaji.m@pharmeasy.in"]
+dag_name = "daily_covid_orders_report_emr"
+schedule_interval = '30 04 * * *' # Run every day at 10:00AM IST
+dags_folder = "Marketing_dashboards/"
+python_version = "3.6"
+dag_description = "daily_covid_orders_report_hive"
+
+airflow_home = os.environ.get("AIRFLOW_HOME")
+sys.path.insert(0, airflow_home + "/dags/apps/")
+import pe_analytics_module as pam
+from skull_mr_operator_analytics import SkullMROperatorAnalytics
+
+
+default_args = {
+                "owner" : dag_owner,
+                "depends_on_past" : False,
+                "start_date" : start_date,
+                "email" : email_ids,
+                "email_on_failure" : True,
+                "email_on_retry" : False,
+                 "retries":1
+               }
+
+dag = DAG(
+          dag_name,
+          default_args = default_args,
+          description = dag_description,
+          catchup = False,
+          schedule_interval = schedule_interval
+         )
+
+def format_html(df, title=''):
+    '''
+    Write an entire dataframe to an HTML file with nice formatting.
+    '''
+
+    result = '''
+<html>
+<head>
+<style>
+    h2 {
+        text-align: left;
+        font-family: Helvetica, Arial, sans-serif;
+    }
+    table {
+        margin-left: auto;
+        margin-right: auto;
+    }
+    table, th, td {
+        border: 1px solid black;
+        border-collapse: collapse;
+    }
+    th {
+        padding: 5px;
+        text-align: left;
+        font-family: Helvetica, Arial, sans-serif;
+        font-size: 85%;
+        background-color:#ebebeb;
+    }
+    td {
+        padding: 5px;
+        text-align: left;
+        font-family: Helvetica, Arial, sans-serif;
+        font-size: 85%;
+    }
+    tr:hover {
+        background-color: #dddddd;
+    }
+    .wide {
+        width: 90%;
+    }
+</style>
+</head>
+<body>
+    '''
+    result += '<h2> %s </h2>\n' % title
+    result += df.to_html(index = False, classes='wide', escape=False)
+    result += '''
+</body>
+</html>
+'''
+    return result
+
+
+iam_role = Variable.get("pe-role-analytics-password-dp")
+s3_folder_path="s3://pe-skull-external-data/analytics/pe/hive-to-redshift-migration/marketing_partner_reports/daily_covid_orders_report/"
+s3_query_folder="Marketing_dashboards"
+
+master_query = """
+set hive.exec.orc.split.strategy=BI;
+set hive.exec.reducers.max=97;
+set hive.vectorized.execution.enabled=false;
+set hive.vectorized.execution.reduce.enabled=false;
+set mapreduce.reduce.memory.mb = 10096 ;
+SET hive.groupby.orderby.position.alias=true;
+SET hive.strict.checks.cartesian.product=false;
+set hive.exec.dynamic.partition.mode=nonstrict;
+set hive.exec.max.dynamic.partitions=2000;
+set hive.exec.max.dynamic.partitions.pernode=1000;
+set hive.tez.container.size=10192;
+set hive.tez.java.opts = -Xmx13312m;
+set hive.auto.convert.join=false;
+drop TABLE IF EXISTS adhoc_analysis.covid_orders;
+create table adhoc_analysis.covid_orders as
+with top_20_cities as (
+select 
+case when fo.delivery_city_name  in ('Delhi','Gurgaon','Noida','Ghaziabad','Delhi NCR') then 'Delhi Group'
+when fo.delivery_city_name  in ('Thane','Mumbai','Navi Mumbai','Dombivli') then 'Mumbai Group'
+when fo.delivery_city_name in ('Kolkata','Howrah','Birati','Kolkata Area','Hooghly') then 'Kolkata Group'
+else fo.delivery_city_name end as city, 
+count(distinct foc.order_id) as orders
+from (Select * from data_model.f_order_consumer_snapshot where dt>'2021-11-01') foc
+join (Select * from data_model.f_order where dt>'2021-11-01') fo on fo.order_id = foc.order_id
+where foc.order_placed_date between '2021-12-01' and date_sub(current_date,1)
+group by 1
+order by orders desc
+limit 20
+),
+base_table as (
+select 
+foc.order_placed_date,
+COALESCE(tc.city, 'Other cities') as top_city,
+case when dcp.tags is not null then 'covid' else 'Non_covid' end as covid_tag,
+foc.order_id 
+from (Select * from data_model.f_order_consumer_snapshot where dt>'2021-11-01') foc
+join (Select * from data_model.f_order where dt>'2021-11-01') fo on fo.order_id = foc.order_id
+left join (select * from data_model.f_order_ucode where dt>'2021-11-01')fou on foc.order_id =fou.order_id 
+left join data_model.d_catalog_product dcp on dcp.ucode =fou.ucode
+left join top_20_cities tc on lower(tc.city) = lower(
+case when fo.delivery_city_name  in ('Delhi','Gurgaon','Noida','Ghaziabad','Delhi NCR') then 'Delhi Group'
+when fo.delivery_city_name  in ('Thane','Mumbai','Navi Mumbai','Dombivli') then 'Mumbai Group'
+when fo.delivery_city_name in ('Kolkata','Howrah','Birati','Kolkata Area','Hooghly') then 'Kolkata Group'
+else fo.delivery_city_name end)
+where foc.order_placed_date between '2021-12-01' and '2021-12-28'
+group by 1,2,3,4
+union 
+select 
+foc.order_placed_date,
+COALESCE(tc.city, 'Other cities') as top_city,
+case when dcp.tags is not null then 'covid' else 'Non_covid' end as covid_tag,
+foc.order_id 
+from (Select * from data_model.f_order_consumer_snapshot where dt>'2021-11-01') foc
+join (Select * from data_model.f_order where dt>'2021-11-01') fo on fo.order_id = foc.order_id
+left join (select * from data_model.f_order_ucode where dt>'2021-11-01') fou on foc.order_id =fou.order_id 
+left join data_model.d_catalog_product dcp on dcp.ucode =fou.ucode
+left join top_20_cities tc on lower(tc.city) = lower(
+case when fo.delivery_city_name  in ('Delhi','Gurgaon','Noida','Ghaziabad','Delhi NCR') then 'Delhi Group'
+when fo.delivery_city_name  in ('Thane','Mumbai','Navi Mumbai','Dombivli') then 'Mumbai Group'
+when fo.delivery_city_name in ('Kolkata','Howrah','Birati','Kolkata Area','Hooghly') then 'Kolkata Group'
+else fo.delivery_city_name end)
+where foc.order_placed_date >= date_sub(current_date,2) and foc.order_placed_date <= date_sub(current_date,1)
+group by 1,2,3,4
+)
+select * from
+(
+(
+select 
+top_city,
+count(distinct case when order_placed_date= date_sub(current_date,1) then order_id end) as D_1_orders,
+count(distinct case when order_placed_date= date_sub(current_date,1) and covid_tag ='covid' then order_id end) as D_1_Covid_orders,
+count(distinct case when order_placed_date= date_sub(current_date,2) then order_id end) as D_2_orders,
+count(distinct case when order_placed_date= date_sub(current_date,2) and covid_tag ='covid' then order_id end) as D_2_Covid_orders,
+round((count(distinct case when order_placed_date between '2021-12-01' and '2021-12-28' then order_id end)/28)) as Avg_Dec_1_to_28_orders,
+round((count(distinct case when order_placed_date between '2021-12-01' and '2021-12-28' and covid_tag ='covid' then order_id end)/28)) as Avg_Dec_1_to_28_Covid_orders,
+coalesce(round((count(distinct case when order_placed_date= date_sub(current_date,1) and covid_tag ='covid' then order_id end)*100)/count(distinct case when order_placed_date= date_sub(current_date,1) then order_id end),2),0) as D_1_covid_orders_per,
+coalesce(round((count(distinct case when order_placed_date= date_sub(current_date,2) and covid_tag ='covid' then order_id end)*100)/count(distinct case when order_placed_date= date_sub(current_date,2) then order_id end),2),0) as D_2_covid_orders_per,
+coalesce(round(((count(distinct case when order_placed_date between '2021-12-01' and '2021-12-28' and covid_tag ='covid' then order_id end)/28)*100)/(count(distinct case when order_placed_date between '2021-12-01' and '2021-12-28' then order_id end)/28),2),0) as Dec_Avg_covid_orders_per,
+coalesce(round(((count(distinct case when order_placed_date= date_sub(current_date,1) and covid_tag ='covid' then order_id end)-(count(distinct case when order_placed_date= date_sub(current_date,2) and covid_tag ='covid' then order_id end)))*100)
+/count(distinct case when order_placed_date = date_sub(current_date,2) and covid_tag ='covid' then order_id end),2),0)as delta_wrt_D2_covid,
+coalesce(round(((count(distinct case when order_placed_date= date_sub(current_date,1) and covid_tag ='covid' then order_id end)-(count(distinct case when order_placed_date between '2021-12-01' and '2021-12-28' and covid_tag ='covid' then order_id end)/28))*100)
+/((count(distinct case when order_placed_date between '2021-12-01' and '2021-12-28' and covid_tag ='covid' then order_id end)/28)),2),0)as delta_wrt_Dec_covid_Avg,
+coalesce(round(((count(distinct case when order_placed_date= date_sub(current_date,1) then order_id end)-(count(distinct case when order_placed_date= date_sub(current_date,2) then order_id end)))*100)
+/count(distinct case when order_placed_date = date_sub(current_date,2) then order_id end),2),0)as delta_wrt_D2_orders,
+coalesce(round(((count(distinct case when order_placed_date= date_sub(current_date,1) then order_id end)-(count(distinct case when order_placed_date between '2021-12-01' and '2021-12-28' then order_id end)/28))*100)
+/((count(distinct case when order_placed_date between '2021-12-01' and '2021-12-28' then order_id end)/28)),2),0)as delta_wrt_Dec_Avg_orders
+from base_table 
+group by 1
+)
+union
+(
+select 
+'1 >> Total' as top_city,
+count(distinct case when order_placed_date= date_sub(current_date,1) then order_id end) as D_1_orders,
+count(distinct case when order_placed_date= date_sub(current_date,1) and covid_tag ='covid' then order_id end) as D_1_Covid_orders,
+count(distinct case when order_placed_date= date_sub(current_date,2) then order_id end) as D_2_orders,
+count(distinct case when order_placed_date= date_sub(current_date,2) and covid_tag ='covid' then order_id end) as D_2_Covid_orders,
+round((count(distinct case when order_placed_date between '2021-12-01' and '2021-12-28' then order_id end)/28)) as Avg_Dec_1_to_28_orders,
+round((count(distinct case when order_placed_date between '2021-12-01' and '2021-12-28' and covid_tag ='covid' then order_id end)/28)) as Avg_Dec_1_to_28_Covid_orders,
+coalesce(round((count(distinct case when order_placed_date= date_sub(current_date,1) and covid_tag ='covid' then order_id end)*100)/count(distinct case when order_placed_date= date_sub(current_date,1) then order_id end),2),0) as D_1_covid_orders_per,
+coalesce(round((count(distinct case when order_placed_date= date_sub(current_date,2) and covid_tag ='covid' then order_id end)*100)/count(distinct case when order_placed_date= date_sub(current_date,2) then order_id end),2),0) as D_2_covid_orders_per,
+coalesce(round(((count(distinct case when order_placed_date between '2021-12-01' and '2021-12-28' and covid_tag ='covid' then order_id end)/28)*100)/(count(distinct case when order_placed_date between '2021-12-01' and '2021-12-28' then order_id end)/28),2),0) as Dec_Avg_covid_orders_per,
+coalesce(round(((count(distinct case when order_placed_date= date_sub(current_date,1) and covid_tag ='covid' then order_id end)-(count(distinct case when order_placed_date= date_sub(current_date,2) and covid_tag ='covid' then order_id end)))*100)
+/count(distinct case when order_placed_date = date_sub(current_date,2) and covid_tag ='covid' then order_id end),2),0)as delta_wrt_D2_covid,
+coalesce(round(((count(distinct case when order_placed_date= date_sub(current_date,1) and covid_tag ='covid' then order_id end)-(count(distinct case when order_placed_date between '2021-12-01' and '2021-12-28' and covid_tag ='covid' then order_id end)/28))*100)
+/((count(distinct case when order_placed_date between '2021-12-01' and '2021-12-28' and covid_tag ='covid' then order_id end)/28)),2),0)as delta_wrt_Dec_covid_Avg,
+coalesce(round(((count(distinct case when order_placed_date= date_sub(current_date,1) then order_id end)-(count(distinct case when order_placed_date= date_sub(current_date,2) then order_id end)))*100)
+/count(distinct case when order_placed_date = date_sub(current_date,2) then order_id end),2),0)as delta_wrt_D2_orders,
+coalesce(round(((count(distinct case when order_placed_date= date_sub(current_date,1) then order_id end)-(count(distinct case when order_placed_date between '2021-12-01' and '2021-12-28' then order_id end)/28))*100)
+/((count(distinct case when order_placed_date between '2021-12-01' and '2021-12-28' then order_id end)/28)),2),0)as delta_wrt_Dec_Avg_orders
+from base_table 
+)
+)b
+order by d_1_orders desc;
+"""
+
+overwrite_query=""" select * from adhoc_analysis.covid_orders """
+
+hive_to_s3_query=""" set hive.exec.orc.split.strategy=BI;
+set hive.exec.reducers.max=97;
+set hive.vectorized.execution.enabled=false;
+set hive.vectorized.execution.reduce.enabled=false;
+set mapreduce.reduce.memory.mb = 10096 ;
+SET hive.groupby.orderby.position.alias=true;
+SET hive.strict.checks.cartesian.product=false;
+set hive.exec.dynamic.partition.mode=nonstrict;
+set hive.exec.max.dynamic.partitions=2000;
+set hive.exec.max.dynamic.partitions.pernode=1000;
+set hive.tez.container.size=10192;
+set hive.tez.java.opts = -Xmx13312m;
+set hive.auto.convert.join=false;
+insert overwrite directory '{s3path}/' row format delimited fields terminated by '^' NULL DEFINED AS 'NULL' {sourcequery};""".format(s3path = s3_folder_path, sourcequery = overwrite_query)
+
+master_query = SkullMROperatorAnalytics(
+                          task_id ="master_query_data",
+                          cluster_name = Variable.get("DP_EMR_HIVE_CLUSTER"),
+                          name = "hive_to_s3_query",
+                          arguments = master_query,
+                          queue = "HIVE_queue",
+                          query_location = "analytics/pe/emr_queries/" + s3_query_folder + '/',
+                          filename = None,
+                          query_airflow_location = None,
+                          s3_bucket = "pe-skull-external-data",
+                          dag = dag
+                          ) 
+write_data_to_s3 = SkullMROperatorAnalytics(
+                          task_id ="write_to_s3",
+                          cluster_name = Variable.get("DP_EMR_HIVE_CLUSTER"),
+                          name = "hive_to_s3_query",
+                          arguments = hive_to_s3_query,
+                          queue = "HIVE_queue",
+                          query_location = "analytics/pe/emr_queries/" + s3_query_folder + '/',
+                          filename = None,
+                          query_airflow_location = None,
+                          s3_bucket = "pe-skull-external-data",
+                          dag = dag
+                          ) 
+
+
+def func():
+    yesterday = date.today() - timedelta(days=1)
+    pe_email_password = os.environ.get("REPORT_EMAIL_PASSWORD")
+    df1 = df_from_partfiles(partfilesbucket='pe-skull-external-data',partfilespath ='analytics/pe/hive-to-redshift-migration/marketing_partner_reports/daily_covid_orders_report/',partfiledelimiter='^', partfileiamrole=iam_role, partfiledatatype = str,partfileheader=None)
+    df1.columns=['Top City','D-1 Orders','D-1 Covid Orders','D-2 Orders','D-2 Covid Orders','Avg Dec (1-28) Orders','Avg Dec (1-28) Covid Orders',' % D-1 Covid Orders','% D-2 Covid Orders','% Avg Dec (1-28) Covid Orders','Delta w.r.t D-2 covid orders','Delta w.r.t Dec Avg covid orders','Delta w.r.t D-2 orders','Delta w.r.t Dec Avg orders']
+    me = "reporting@pharmeasy.in"
+    you = 'balaji.m@pharmeasy.in'
+#     you="amit.singh@pharmeasy.in,meha.chittoori@pharmeasy.in,dhani.savla@pharmeasy.in,marketinganalytics@pharmeasy.in"	
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = 'Daily Covid Orders Report - '+ str(yesterday)
+    msg['From'] = me
+    msg['To'] = you
+    emailbody = (format_html(df1,'# City wise D-1 & D-2 Covid Orders w.r.t Avg Dec 1 to Dec 28 orders') )
+    
+    part2 = MIMEText(emailbody, 'html')
+    
+    msg.attach(part2)
+    s = smt.SMTP_SSL('smtp.gmail.com', 465)
+    s.login(me,pe_email_password)
+    s.sendmail(me,you.split(','),msg.as_string())
+    s.quit()
+
+    print("Automated Emails Sent")
+          
+fo_task = ExternalTaskSensor(task_id="f_order_update_check", external_dag_id='Hive_F_order_combined',
+                                  external_task_id="f_order_update_data_model_f_order",execution_delta = timedelta(hours = 4, minutes = 30),dag=dag,
+			    timeout = 3600) #FO runs at 5:30 AM IST and ends at around 6 20
+
+foc_task = ExternalTaskSensor(task_id="foc_update_check", external_dag_id='hive_f_order_consumer_emr',
+                                  external_task_id="overwrite", execution_delta = timedelta(hours = 4, minutes = 30),dag=dag,
+			      timeout = 3600)#foc runs at 5:30
+      
+      
+t1 = PythonOperator(
+                    task_id = "redshift_execution",
+                    python_callable = func,
+                    op_kwargs={},
+                    dag = dag
+                   )
+    
+    
+cross_downstream([fo_task,foc_task],[master_query])     
+master_query >> write_data_to_s3 >> t1
