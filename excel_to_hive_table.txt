@@ -1,0 +1,106 @@
+# Importing required libraries
+import os
+import boto3
+import time
+import psycopg2 as ps2
+from os import path
+from airflow import DAG
+from airflow.operators.python_operator import PythonOperator
+from airflow.models import Variable
+from datetime import date
+from datetime import datetime
+from airflow.utils.helpers import cross_downstream
+import pe_analytics_module as pam
+from airflow.operators.sensors import ExternalTaskSensor
+from pe_analytics_module import upload_file_to_s3
+
+from io import StringIO
+import pandas as pd
+import email
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+import smtplib as smt
+from datetime import timedelta
+
+# Importing dqm_hive_foc module
+import sys
+AIRFLOW_HOME = os.environ.get("AIRFLOW_HOME")
+sys.path.insert(0, AIRFLOW_HOME+"/dags/")
+from skull_mr_operator_analytics import SkullMROperatorAnalytics
+
+
+# Creating the required variables
+dag_owner = "marketinganalytics@pharmeasy.in"
+start_date = datetime(2021,8,5)
+email_ids = ["marketinganalytics@pharmeasy.in"]
+dag_name = "excel_to_hive"
+schedule_interval = "0 0 * * *" # Run every day at 5:30 A.M. IST 
+dags_folder = "Marketing_dashboards/" 
+python_version = "3.6"
+dag_description = "excel_to_hive"
+s3_query_folder='Marketing_dashboards'
+
+
+
+default_args = {
+                "owner" : dag_owner,
+                "depends_on_past" : False,
+                "start_date" : start_date,
+                "email" : email_ids,
+                "email_on_failure" : True,
+                "email_on_retry" : False
+               }
+dag = DAG(
+          dag_name,
+          default_args = default_args,
+          description = dag_description,
+          catchup = False,
+          schedule_interval = schedule_interval
+         )
+
+# os.remove('vle_agent_details.csv')
+
+def func():
+  file_path = AIRFLOW_HOME + "/dags/apps/Marketing_dashboards/digital_rnp_mobile_num.xlsx"
+  tabledf = pd.read_excel(file_path)
+  tabledf.to_csv('digital_rnp_mobile_num.csv',index=False,header=False)
+  iam_role = Variable.get("pe-role-analytics-password-dp")
+  upload_file_to_s3("digital_rnp_mobile_num.csv","pe-skull-external-data","analytics/pe/marketing/digital_rnp_mobile_num/",ts=None,convert_to_csv=False,iamrole=iam_role)
+  os.remove('digital_rnp_mobile_num.csv')
+  
+  
+query_a = """
+DROP TABLE IF EXISTS adhoc_analysis.digital_rnp_mobile_num ;
+CREATE EXTERNAL TABLE IF NOT EXISTS adhoc_analysis.digital_rnp_mobile_num
+(
+    mobile_number string
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+STORED AS TEXTFILE LOCATION
+'s3://pe-skull-external-data/analytics/pe/marketing/digital_rnp_mobile_num/';
+"""	
+
+
+data_push = PythonOperator(
+                    task_id = "data_push",
+                    python_callable = func,
+                    op_kwargs={},
+                    dag = dag
+                   )
+
+table_creation_a = SkullMROperatorAnalytics(
+task_id = "csv_to_hive",
+cluster_name = Variable.get("DP_EMR_HIVE_CLUSTER"),
+name = "csv_to_hive_table",
+arguments = query_a,
+query_location = "analytics/pe/emr_queries/" + s3_query_folder + '/',
+filename = None,
+query_airflow_location = None,
+s3_bucket = "pe-skull-external-data",
+dag = dag
+)
+
+
+
+data_push >> table_creation_a
